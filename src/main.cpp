@@ -29,6 +29,7 @@ void setup() {
     tiDebugParseApp(buf, fileLen);
 
     tiSetup();
+    cbl.setVerbosity(true, &Serial);
     delay(2000);
 
     Serial.println("Attempting app send...");
