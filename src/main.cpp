@@ -1,18 +1,42 @@
 #include <Arduino.h>
-
-// put function declarations here:
-int myFunction(int, int);
+#include <LittleFS.h>
+#include "tiAppSend.h"
+#include "tiComms.h"
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+    Serial.begin(115200);
+    delay(6000);
+
+    if (!LittleFS.begin()) {
+        Serial.println("LittleFS mount failed");
+        return;
+    }
+
+    File f = LittleFS.open("/noteflio.8xk", "r");
+    if (!f) {
+        Serial.println("File not found");
+        return;
+    }
+
+    int fileLen = f.size();
+    uint8_t* buf = (uint8_t*)malloc(fileLen);
+    f.read(buf, fileLen);
+    f.close();
+
+    Serial.print("File size: ");
+    Serial.println(fileLen);
+
+    tiDebugParseApp(buf, fileLen);
+
+    tiSetup();
+    delay(2000);
+
+    Serial.println("Attempting app send...");
+    int result = tiSendApp(buf, fileLen);
+    Serial.print("Result: ");
+    Serial.println(result);
+
+    free(buf);
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
-}
-
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
-}
+void loop() {}
