@@ -3,7 +3,9 @@
 #include <Arduino.h>
 
 bool nasConnect();
+bool nasConnectWithCreds(const char* ssid, const char* pass);
 void nasDisconnect();
 bool nasListFiles(char* outBuffer, int maxLen);
 bool nasDownloadFile(const char* filename, uint8_t* outBuffer, int* outLen, int maxLen);
 bool nasIsConnected();
+String nasGetSSID();

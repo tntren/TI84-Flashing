@@ -2,8 +2,9 @@
 #include "config.h"
 #include "tiComms.h"
 #include "nasClient.h"
+#include "tiAppSend.h"
 
-static uint8_t fileBuffer[MAXDATALEN];
+#define FILE_BUFFER_SIZE 24576
 
 void handleSerialCommand(String input) {
     input.trim();
@@ -58,17 +59,21 @@ void handleSerialCommand(String input) {
         }
         String filename = input.substring(5);
         filename.trim();
-        if (!filename.endsWith(".8xp")) {
-            Serial.println("Only .8xp program files are supported, use TI-Connect for .8xk apps");
-            return;
-        }
-        int fileLen = 0;
         Serial.print("Downloading: ");
         Serial.println(filename);
-        if (nasDownloadFile(filename.c_str(), fileBuffer, &fileLen, MAXDATALEN)) {
+        uint8_t* fileBuffer = (uint8_t*)malloc(FILE_BUFFER_SIZE);
+        if (!fileBuffer) { Serial.println("malloc failed"); return; }
+        int fileLen = 0;
+        if (nasDownloadFile(filename.c_str(), fileBuffer, &fileLen, FILE_BUFFER_SIZE)) {
             Serial.println("Sending to calculator...");
             delay(1000);
-            int result = tiSendProgram(fileBuffer, fileLen);
+            int result;
+            if (filename.endsWith(".8xk")) {
+                Serial.println("Flash app, using tiSendApp");
+                result = tiSendApp(fileBuffer, fileLen);
+            } else {
+                result = tiSendProgram(fileBuffer, fileLen);
+            }
             if (result == 0) {
                 Serial.println("Done, check your calculator");
             } else {
@@ -78,6 +83,7 @@ void handleSerialCommand(String input) {
         } else {
             Serial.println("Download failed");
         }
+        free(fileBuffer);
         return;
     }
 

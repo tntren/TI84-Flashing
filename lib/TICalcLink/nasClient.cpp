@@ -8,6 +8,8 @@
 static String sid = "";
 static String synoToken = "";
 static bool connected = false;
+static String currentSSID = "";
+static String currentPass = "";
 
 static String urlEncode(const String& s) {
     String encoded = "";
@@ -55,17 +57,8 @@ static bool httpGet(const String& url, String& responseOut) {
     http.begin(client, url);
     http.setTimeout(10000);
     int code = http.GET();
-    Serial.print("HTTP ");
-    Serial.println(code);
-    if (code <= 0) {
-        Serial.print("HTTP error: ");
-        Serial.println(http.errorToString(code));
-        http.end();
-        return false;
-    }
     if (code != 200) {
-        Serial.print("Unexpected HTTP code: ");
-        Serial.println(code);
+        Serial.print("HTTP error: "); Serial.println(code);
         http.end();
         return false;
     }
@@ -74,67 +67,63 @@ static bool httpGet(const String& url, String& responseOut) {
     return true;
 }
 
+static bool nasLogin() {
+    String loginExtra = "account=" + urlEncode(String(NAS_USER))
+                      + "&passwd=" + urlEncode(String(NAS_PASS))
+                      + "&enable_syno_token=yes";
+    String url = buildUrl("SYNO.API.Auth", "login", 6, loginExtra.c_str());
+
+    String response;
+    if (!httpGet(url, response)) return false;
+
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, response) || !doc["success"].as<bool>()) {
+        Serial.print("NAS login failed: "); Serial.println(response);
+        return false;
+    }
+
+    sid = doc["data"]["sid"].as<String>();
+    synoToken = doc["data"]["synotoken"].as<String>();
+    if (synoToken.length() == 0)
+        synoToken = doc["data"]["SynoToken"].as<String>();
+
+    connected = true;
+    Serial.println("NAS logged in");
+    return true;
+}
+
+// Connect with creds from config.h (fallback)
 bool nasConnect() {
-    Serial.print("Connecting to WiFi");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    return nasConnectWithCreds(WIFI_SSID, WIFI_PASS);
+}
+
+// Connect with creds from calculator Str9
+bool nasConnectWithCreds(const char* ssid, const char* pass) {
+    currentSSID = String(ssid);
+    currentPass = String(pass);
+
+    Serial.print("WiFi connecting to: "); Serial.println(ssid);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(ssid, pass);
+
     int tries = 0;
     while (WiFi.status() != WL_CONNECTED && tries < 20) {
         delay(500);
         Serial.print(".");
         tries++;
     }
+    Serial.println();
+
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println(" failed");
+        Serial.println("WiFi failed");
         return false;
     }
-    Serial.println(" connected");
-    Serial.print("IP: ");
+
+    Serial.print("WiFi connected, IP: ");
     Serial.println(WiFi.localIP());
 
-    // Build login URL with properly encoded credentials
-    String loginExtra = "account=" + urlEncode(String(NAS_USER))
-                      + "&passwd=" + urlEncode(String(NAS_PASS))
-                      + "&enable_syno_token=yes";
-    String url = buildUrl("SYNO.API.Auth", "login", 6, loginExtra.c_str());
-
-    Serial.println("Logging into NAS...");
-    String response;
-    if (!httpGet(url, response)) {
-        Serial.println("NAS login request failed");
-        return false;
-    }
-
-    Serial.println(response);  // print raw response so you can see what came back
-
-    DynamicJsonDocument doc(1024);
-    DeserializationError err = deserializeJson(doc, response);
-    if (err) {
-        Serial.print("JSON parse error: ");
-        Serial.println(err.c_str());
-        return false;
-    }
-
-    if (!doc["success"].as<bool>()) {
-        int errCode = doc["error"]["code"].as<int>();
-        Serial.print("NAS login rejected, error code: ");
-        Serial.println(errCode);
-        // Common codes: 400=invalid password, 401=account disabled, 403=permission denied
-        return false;
-    }
-
-    sid = doc["data"]["sid"].as<String>();
-    // Synology returns it as "synotoken" (lowercase)
-    synoToken = doc["data"]["synotoken"].as<String>();
-    if (synoToken.length() == 0) {
-        // Some DSM versions capitalize it differently
-        synoToken = doc["data"]["SynoToken"].as<String>();
-    }
-
-    connected = true;
-    Serial.println("NAS logged in OK");
-    Serial.print("SID: ");
-    Serial.println(sid);
-    return true;
+    return nasLogin();
 }
 
 void nasDisconnect() {
@@ -146,11 +135,15 @@ void nasDisconnect() {
     synoToken = "";
     connected = false;
     WiFi.disconnect(true);
-    Serial.println("NAS logged out");
+    Serial.println("NAS disconnected");
 }
 
 bool nasIsConnected() {
-    return connected;
+    return connected && WiFi.status() == WL_CONNECTED;
+}
+
+String nasGetSSID() {
+    return currentSSID;
 }
 
 bool nasListFiles(char* outBuffer, int maxLen) {
@@ -170,12 +163,18 @@ bool nasListFiles(char* outBuffer, int maxLen) {
     String result = "";
     int i = 0;
     for (JsonObject file : doc["data"]["files"].as<JsonArray>()) {
-        result += String(i + 1) + ":" + file["name"].as<String>() + "\n";
-        i++;
+        String name = file["name"].as<String>();
+        // Only show TI file types
+        if (name.endsWith(".8xk") || name.endsWith(".8xp") ||
+            name.endsWith(".8xl") || name.endsWith(".8xv") ||
+            name.endsWith(".8xn") || name.endsWith(".8xi")) {
+            result += String(i + 1) + ":" + name + "\n";
+            i++;
+        }
     }
 
     strncpy(outBuffer, result.c_str(), maxLen);
-    return true;
+    return i > 0;
 }
 
 bool nasDownloadFile(const char* filename, uint8_t* outBuffer, int* outLen, int maxLen) {
@@ -189,17 +188,11 @@ bool nasDownloadFile(const char* filename, uint8_t* outBuffer, int* outLen, int 
     http.begin(client, url);
     http.setTimeout(15000);
     int code = http.GET();
-    Serial.print("Download HTTP ");
-    Serial.println(code);
     if (code != 200) {
-        Serial.println(http.getString());
+        Serial.print("Download HTTP error: "); Serial.println(code);
         http.end();
         return false;
     }
-
-    int contentLen = http.getSize();
-    Serial.print("File size: ");
-    Serial.println(contentLen);
 
     WiFiClient* stream = http.getStreamPtr();
     int len = 0;
@@ -207,12 +200,11 @@ bool nasDownloadFile(const char* filename, uint8_t* outBuffer, int* outLen, int 
     while ((stream->available() || millis() < timeout) && len < maxLen) {
         if (stream->available()) {
             outBuffer[len++] = stream->read();
-            timeout = millis() + 2000; // reset timeout on data
+            timeout = millis() + 2000;
         }
     }
     *outLen = len;
     http.end();
-    Serial.print("Downloaded bytes: ");
-    Serial.println(len);
+    Serial.print("Downloaded "); Serial.print(len); Serial.println(" bytes");
     return len > 0;
 }

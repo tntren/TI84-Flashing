@@ -11,9 +11,9 @@ extern uint8_t tiData[MAXDATALEN];
 
 void tiSetup();
 void tiTick();
-
 void tiQueueReal(char varName, double value);
 void tiQueueString(char strIndex, const char* text);
+void tiClearStringQueue();
 int tiSendProgram(uint8_t* fileData, int fileLen);
 void tiSendExamExit();
 

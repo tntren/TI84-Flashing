@@ -1,19 +1,20 @@
 #include "tiAppSend.h"
 #include "tiComms.h"
 
-#define FLASH_APP_TYPE 0x24
-#define APP_CHUNK_SIZE 0x80
+#define FLASH_APP_TYPE 0x24  // TI type byte for flash applications
+#define APP_CHUNK_SIZE 0x80  // TI-83+/84+ flash apps transfer in 128-byte chunks
 
 #ifndef VER
-#define VER 0x2D
+#define VER 0x2D  // DBUS version request command
 #endif
 
+// Represents one 16KB flash page parsed from the .8xk Intel HEX payload
 struct FlashPage {
-    uint16_t addr;
-    uint16_t page;
-    uint8_t  flag;
+    uint16_t addr;       // base address within the page (usually 0x4000)
+    uint16_t page;       // flash page number
+    uint8_t  flag;       // 0x80 for the first section, toggles on each HEX_END record
     uint8_t  data[0x4000];
-    uint16_t size;
+    uint16_t size;       // number of bytes actually populated (rest is 0xFF pad)
 };
 
 static uint8_t hexNib(char c) {
@@ -27,6 +28,13 @@ static uint8_t hexByte(const char* s) {
     return (hexNib(s[0]) << 4) | hexNib(s[1]);
 }
 
+// Parse the Intel HEX payload embedded in a .8xk file into a FlashPage struct.
+//
+// .8xk files are a TI wrapper around standard Intel HEX. Record types used:
+//   0x00 = data, 0x01 = end-of-section (toggles flag), 0x02 = page number
+//
+// Only the first page is parsed — multi-page apps would need to call this
+// repeatedly, advancing the pointer past each HEX_END record.
 static bool parseFlashPage(const uint8_t* hexData, uint32_t hexLen, FlashPage* fp) {
     memset(fp->data, 0xFF, sizeof(fp->data));
     fp->addr = 0; fp->page = 0; fp->flag = 0x80; fp->size = 0;
@@ -42,11 +50,15 @@ static bool parseFlashPage(const uint8_t* hexData, uint32_t hexLen, FlashPage* f
         addr            |= hexByte((const char*)&hexData[i]); i += 2;
         uint8_t rectype  = hexByte((const char*)&hexData[i]); i += 2;
         if (rectype == 0x01) {
+            // HEX_END: marks the boundary between flash sections.
+            // flag toggles between 0x80 and 0x00 on each section boundary —
+            // the calc uses this to distinguish the first page from subsequent ones.
             flashAddr = 0; flashPage = 0; flag ^= 0x80;
-            if (fp->size > 0) break;
+            if (fp->size > 0) break;  // done with the first page
             i += 2; continue;
         }
         if (rectype == 0x02) {
+            // HEX_PAGE: next two bytes are the flash page number (big-endian)
             uint16_t ph = hexByte((const char*)&hexData[i]); i += 2;
             uint16_t pl = hexByte((const char*)&hexData[i]); i += 2;
             flashPage = (ph << 8) | pl;
@@ -54,6 +66,7 @@ static bool parseFlashPage(const uint8_t* hexData, uint32_t hexLen, FlashPage* f
             i += 2; continue;
         }
         if (rectype == 0x00) {
+            // First data record after a page change sets the base address
             if (newPage) { flashAddr = addr; newPage = false; }
             if (!gotAddr) {
                 fp->addr = flashAddr; fp->page = flashPage;
@@ -80,6 +93,7 @@ void tiDebugParseApp(uint8_t* fileData, int fileLen) {
     uint8_t nameLen = fileData[0x10];
     char appName[9] = {0};
     memcpy(appName, &fileData[0x11], min((int)nameLen, 8));
+    // Hex payload length is a little-endian uint32 at offset 0x4A
     uint32_t hexLen = fileData[0x4A]
                     | ((uint32_t)fileData[0x4B] << 8)
                     | ((uint32_t)fileData[0x4C] << 16)
@@ -102,6 +116,9 @@ void tiDebugParseApp(uint8_t* fileData, int fileLen) {
     Serial.println();
 }
 
+// Before sending flash data, the calc requires a version handshake.
+// The sequence is: VER -> ACK -> CTS -> ACK -> DATA(version info) -> ACK
+// This is the same regardless of what app you're about to send.
 static int getVersionHandshake() {
     uint8_t msgHdr[4];
     int dataLength = 0;
@@ -139,18 +156,28 @@ static int getVersionHandshake() {
     return 0;
 }
 
-// Send one 128-byte chunk:
-// VAR -> ACK -> CTS -> ACK -> DATA(128) -> ACK
+// Send one 128-byte chunk of flash data.
+//
+// The DBUS flash transfer protocol requires the full handshake for every chunk:
+//   VAR  -> calc ACKs
+//   CTS  -> we ACK  (calc may delay CTS while it garbage collects flash)
+//   DATA -> calc ACKs
+//
+// The CTS packet is always 4 bytes with no payload, even though its length
+// field echoes back the chunk size. TICL's get() skips the body for CTS.
+//
+// chunkAddr increments by APP_CHUNK_SIZE each call so the calc knows where
+// in the flash page each block belongs.
 static int sendChunk(uint8_t* data, uint16_t chunkAddr, uint16_t flashPage, uint8_t flag) {
     uint8_t msgHdr[4];
     int dataLength = 0;
 
-    // VAR header: 10 bytes
+    // 10-byte VAR header describing this chunk's location in flash
     uint8_t varHdr[10];
     varHdr[0] = APP_CHUNK_SIZE & 0xFF;
     varHdr[1] = (APP_CHUNK_SIZE >> 8) & 0xFF;
     varHdr[2] = FLASH_APP_TYPE;
-    varHdr[3] = APP_CHUNK_SIZE & 0xFF;
+    varHdr[3] = APP_CHUNK_SIZE & 0xFF;  // size is repeated in bytes 3-4
     varHdr[4] = (APP_CHUNK_SIZE >> 8) & 0xFF;
     varHdr[5] = flag;
     varHdr[6] = chunkAddr & 0xFF;
@@ -158,29 +185,26 @@ static int sendChunk(uint8_t* data, uint16_t chunkAddr, uint16_t flashPage, uint
     varHdr[8] = flashPage & 0xFF;
     varHdr[9] = (flashPage >> 8) & 0xFF;
 
-    // VAR
     msgHdr[0] = COMP83P; msgHdr[1] = VAR; msgHdr[2] = 10; msgHdr[3] = 0;
     if (cbl.send(msgHdr, varHdr, 10)) {
         Serial.println("VAR send failed"); return -1;
     }
 
-    // ACK
     if (cbl.get(msgHdr, NULL, &dataLength, 0) || msgHdr[1] != ACK) {
         Serial.print("Expected ACK after VAR, got: 0x"); Serial.println(msgHdr[1], HEX); return -1;
     }
 
-    // CTS — 4 bytes only, length field echoes chunk size but there is no payload
+    // CTS can be slow on the first chunk if the calc needs to garbage collect
+    // flash to make room. 30 second timeout here is intentional.
     if (cbl.get(msgHdr, NULL, &dataLength, 0, 30000000UL) || msgHdr[1] != CTS) {
         Serial.print("Expected CTS, got: 0x"); Serial.println(msgHdr[1], HEX); return -1;
     }
 
-    // ACK the CTS
     msgHdr[0] = COMP83P; msgHdr[1] = ACK; msgHdr[2] = 0; msgHdr[3] = 0;
     if (cbl.send(msgHdr, NULL, 0)) {
         Serial.println("ACK after CTS failed"); return -1;
     }
 
-    // DATA — 128 bytes
     msgHdr[0] = COMP83P; msgHdr[1] = DATA;
     msgHdr[2] = APP_CHUNK_SIZE & 0xFF;
     msgHdr[3] = (APP_CHUNK_SIZE >> 8) & 0xFF;
@@ -188,7 +212,6 @@ static int sendChunk(uint8_t* data, uint16_t chunkAddr, uint16_t flashPage, uint
         Serial.println("DATA send failed"); return -1;
     }
 
-    // ACK after DATA
     dataLength = 0;
     if (cbl.get(msgHdr, NULL, &dataLength, 0, 10000000UL) || msgHdr[1] != ACK) {
         Serial.print("Expected ACK after DATA, got: 0x"); Serial.println(msgHdr[1], HEX); return -1;
@@ -197,6 +220,13 @@ static int sendChunk(uint8_t* data, uint16_t chunkAddr, uint16_t flashPage, uint
     return 0;
 }
 
+// Send a flash app (.8xk) to the calculator.
+//
+// fileData should be the raw bytes of the .8xk file. The HEX payload starts
+// at offset 0x4E; everything before that is the TI file wrapper header.
+//
+// Only single-page apps are supported here. Multi-page apps would need the
+// chunk loop to run once per page with updated page/addr/flag values.
 int tiSendApp(uint8_t* fileData, int fileLen) {
     if (fileLen < 0x4E + 2) { Serial.println("File too small"); return -1; }
 
@@ -219,7 +249,8 @@ int tiSendApp(uint8_t* fileData, int fileLen) {
         Serial.println("Version handshake failed"); return -1;
     }
 
-    // 128 chunks of 128 bytes = 16384 bytes = one full flash page
+    // A 16KB flash page is sent as 128 consecutive 128-byte chunks.
+    // Each chunk goes through the full VAR/CTS/DATA handshake.
     int numChunks = 0x4000 / APP_CHUNK_SIZE;
     for (int chunk = 0; chunk < numChunks; chunk++) {
         uint16_t chunkAddr = fp.addr + (chunk * APP_CHUNK_SIZE);
@@ -231,7 +262,8 @@ int tiSendApp(uint8_t* fileData, int fileLen) {
         }
     }
 
-    // EOT
+    // EOT signals the end of the transfer. The calc validates the full
+    // app signature at this point before making it available in the APPS menu.
     uint8_t msgHdr[4];
     int dataLength = 0;
     msgHdr[0] = COMP83P; msgHdr[1] = EOT; msgHdr[2] = 0; msgHdr[3] = 0;

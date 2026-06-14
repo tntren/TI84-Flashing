@@ -1,43 +1,53 @@
 #include <Arduino.h>
-#include <LittleFS.h>
-#include "tiAppSend.h"
+#include <Preferences.h>
+#include "config.h"
 #include "tiComms.h"
+#include "nasClient.h"
+#include "commands.h"
+
+static String serialBuf = "";
 
 void setup() {
-    Serial.begin(115200);
-    delay(6000);
+    Serial.begin(BAUD_RATE);
+    delay(500);
+    Serial.println("TI84-Flashing starting...");
 
-    if (!LittleFS.begin()) {
-        Serial.println("LittleFS mount failed");
-        return;
+    // Try to load WiFi creds from NVS (saved by calc via Str9)
+    Preferences prefs;
+    prefs.begin("nasconf", true); // read-only
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+
+    if (ssid.length() > 0) {
+        Serial.print("NVS creds found, connecting to: ");
+        Serial.println(ssid);
+        nasConnectWithCreds(ssid.c_str(), pass.c_str());
+    } else {
+        // Fall back to hardcoded creds in config.h
+        Serial.println("No NVS creds, using config.h defaults");
+        nasConnect();
     }
-
-    File f = LittleFS.open("/noteflio.8xk", "r");
-    if (!f) {
-        Serial.println("File not found");
-        return;
-    }
-
-    int fileLen = f.size();
-    uint8_t* buf = (uint8_t*)malloc(fileLen);
-    f.read(buf, fileLen);
-    f.close();
-
-    Serial.print("File size: ");
-    Serial.println(fileLen);
-
-    tiDebugParseApp(buf, fileLen);
 
     tiSetup();
-    cbl.setVerbosity(true, &Serial);
-    delay(2000);
-
-    Serial.println("Attempting app send...");
-    int result = tiSendApp(buf, fileLen);
-    Serial.print("Result: ");
-    Serial.println(result);
-
-    free(buf);
+    Serial.println("Ready. Send Str9=SSID:PASS from calc to connect.");
+    Serial.println("Type HELP for serial commands.");
 }
 
-void loop() {}
+void loop() {
+    // Handle serial commands
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (serialBuf.length() > 0) {
+                handleSerialCommand(serialBuf);
+                serialBuf = "";
+            }
+        } else {
+            serialBuf += c;
+        }
+    }
+
+    // Handle TI link protocol events
+    tiTick();
+}
