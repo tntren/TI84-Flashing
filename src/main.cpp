@@ -30,6 +30,7 @@ void setup() {
     }
 
     tiSetup();
+    cbl.setVerbosity(true, &Serial);
     Serial.println("Ready. Send Str9=SSID:PASS from calc to connect.");
     Serial.println("Type HELP for serial commands.");
 }

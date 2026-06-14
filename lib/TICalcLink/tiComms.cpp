@@ -58,91 +58,82 @@ void tiClearStringQueue() {
     currentStrIdx = 0;
 }
 
-int tiSendProgram(uint8_t* fileData, int fileLen) {
-    if (fileLen < 74) {
-        Serial.println("File too small to be a valid .8xp");
-        return -1;
+int tiSendProgram(uint8_t* fileData, int fileSize) {
+    // Verified .8xp layout (from real TI-84 Plus file):
+    //   fileData[0..54]   = file header
+    //   varEntry = fileData+55:
+    //     [0..1]  = 0x0D 0x00  (entry flag)
+    //     [2..3]  = varDataLen (little-endian) — covers type+name+ver+arch+2+tokens
+    //     [4]     = type (0x05 = program)
+    //     [5..12] = name (8 bytes, null-padded)
+    //     [13]    = version
+    //     [14]    = archived flag
+    //     [15..16]= progDataLen (token body length, little-endian)
+    //     [17+]   = token bytes
+
+    uint8_t* varEntry = fileData + 55;
+
+    uint16_t varDataLen  = varEntry[2] | ((uint16_t)varEntry[3] << 8);
+    uint16_t progDataLen = varEntry[15] | ((uint16_t)varEntry[16] << 8);
+    uint8_t* progData    = varEntry + 17;
+
+    // Build 13-byte RTS variable header for TI-83+/84+:
+    //   [0..1]  = varDataLen
+    //   [2]     = type
+    //   [3..10] = name (8 bytes)
+    //   [11]    = version
+    //   [12]    = archived
+    uint8_t varHeader[13];
+    varHeader[0] = varEntry[2];   // varDataLen lo
+    varHeader[1] = varEntry[3];   // varDataLen hi
+    varHeader[2] = varEntry[4];   // type = 0x05
+    memcpy(&varHeader[3], &varEntry[5], 8);  // name
+    varHeader[11] = varEntry[13]; // version
+    varHeader[12] = varEntry[14]; // archived
+
+    char nameBuf[9] = {0};
+    memcpy(nameBuf, &varEntry[5], 8);
+    Serial.printf("Sending var: %s type=0x%02x varDataLen=%d progDataLen=%d\n",
+        nameBuf, varEntry[4], varDataLen, progDataLen);
+
+    int result = cbl.sendToCalc(varEntry[4], varHeader, 13, progData, progDataLen);
+    if (result == 0) {
+        Serial.println("Transfer done");
+    } else {
+        Serial.printf("Transfer failed: %d\n", result);
     }
-
-    uint8_t* varData = fileData + 55;
-    int varDataLen = fileLen - 55 - 2;
-
-    uint16_t dataLen = varData[2] | (varData[3] << 8);
-    uint8_t varType = varData[4];
-    char varName[9] = {0};
-    memcpy(varName, &varData[5], 8);
-
-    Serial.print("Sending var: ");
-    Serial.print(varName);
-    Serial.print(" type=0x");
-    Serial.print(varType, HEX);
-    Serial.print(" len=");
-    Serial.println(dataLen);
-
-    uint8_t* progData = varData + 15;
-    int progDataLen = dataLen;
-
-    uint8_t msgHeader[4] = {COMP83P, RTS, 13, 0};
-    uint8_t rtsData[13];
-    rtsData[0] = dataLen & 0xff;
-    rtsData[1] = (dataLen >> 8) & 0xff;
-    rtsData[2] = varType;
-    memset(&rtsData[3], 0, 10);
-    memcpy(&rtsData[3], varName, min((int)strlen(varName), 8));
-
-    int dataLength = 0;
-
-    auto rtsVal = cbl.send(msgHeader, rtsData, 13);
-    if (rtsVal) { Serial.print("RTS failed: "); Serial.println(rtsVal); return rtsVal; }
-
-    cbl.resetLines();
-
-    auto ackVal = cbl.get(msgHeader, NULL, &dataLength, 0);
-    if (ackVal || msgHeader[1] != ACK) { Serial.println("ACK failed"); return -1; }
-
-    auto ctsVal = cbl.get(msgHeader, NULL, &dataLength, 0);
-    if (ctsVal || msgHeader[1] != CTS) { Serial.println("CTS failed"); return -1; }
-
-    msgHeader[1] = ACK; msgHeader[2] = 0x00; msgHeader[3] = 0x00;
-    cbl.send(msgHeader, NULL, 0);
-
-    msgHeader[1] = DATA;
-    msgHeader[2] = progDataLen & 0xff;
-    msgHeader[3] = (progDataLen >> 8) & 0xff;
-    auto dataVal = cbl.send(msgHeader, progData, progDataLen);
-    if (dataVal) { Serial.print("DATA failed: "); Serial.println(dataVal); return dataVal; }
-
-    cbl.get(msgHeader, NULL, &dataLength, 0);
-
-    msgHeader[1] = EOT; msgHeader[2] = 0x00; msgHeader[3] = 0x00;
-    cbl.send(msgHeader, NULL, 0);
-    cbl.get(msgHeader, NULL, &dataLength, 0);
-
-    Serial.println("Transfer done");
-    return 0;
+    return result;
 }
 
 void tiSendExamExit() {
-    uint8_t msgHeader[4] = {COMP83P, RTS, 13, 0};
-    uint8_t rtsData[13] = {0x09, 0x00, VarTypes82::VarProgram, 'D','U','M','M','Y',0x00,0x00,0x00,0x00,0x00};
-    uint8_t progData[9] = {0x09, 0x00, 0x3F, 0x00, 0xDE, 0x00, 0x00, 0x00, 0x00};
-    int dataLen = 0;
+    Serial.println("Exam exit: downloading BROWSER.8xp");
 
-    Serial.println("Sending exam exit...");
-    if (cbl.send(msgHeader, rtsData, 13)) { Serial.println("RTS failed"); return; }
-    cbl.resetLines();
-    if (cbl.get(msgHeader, NULL, &dataLen, 0) || msgHeader[1] != ACK) { Serial.println("ACK failed"); return; }
-    if (cbl.get(msgHeader, NULL, &dataLen, 0) || msgHeader[1] != CTS) { Serial.println("CTS failed"); return; }
-    msgHeader[1] = ACK; msgHeader[2] = 0; msgHeader[3] = 0;
-    cbl.send(msgHeader, NULL, 0);
-    msgHeader[1] = DATA;
-    msgHeader[2] = sizeof(progData) & 0xff;
-    msgHeader[3] = (sizeof(progData) >> 8) & 0xff;
-    if (cbl.send(msgHeader, progData, sizeof(progData))) { Serial.println("DATA failed"); return; }
-    cbl.get(msgHeader, NULL, &dataLen, 0);
-    msgHeader[1] = EOT; msgHeader[2] = 0; msgHeader[3] = 0;
-    cbl.send(msgHeader, NULL, 0);
-    Serial.println("Exam exit done");
+    uint8_t* fileBuffer = (uint8_t*)malloc(FILE_BUFFER_SIZE);
+    if (!fileBuffer) {
+        Serial.println("malloc failed");
+        return;
+    }
+
+    int fileLen = 0;
+    if (!nasDownloadFile("BROWSER.8xp", fileBuffer, &fileLen, FILE_BUFFER_SIZE)) {
+        Serial.println("Download failed");
+        free(fileBuffer);
+        return;
+    }
+
+    Serial.print("Downloaded ");
+    Serial.print(fileLen);
+    Serial.println(" bytes, sending to calc");
+
+    int result = tiSendProgram(fileBuffer, fileLen);
+    free(fileBuffer);
+
+    if (result == 0) {
+        Serial.println("Exam exit done");
+    } else {
+        Serial.print("Exam exit failed: ");
+        Serial.println(result);
+    }
 }
 
 // Determine transfer method from file extension
