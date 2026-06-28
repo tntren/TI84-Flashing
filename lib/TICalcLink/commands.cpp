@@ -4,7 +4,7 @@
 #include "nasClient.h"
 #include "tiAppSend.h"
 
-#define FILE_BUFFER_SIZE 24576
+#define FILE_BUFFER_SIZE 49152
 
 void handleSerialCommand(String input) {
     input.trim();

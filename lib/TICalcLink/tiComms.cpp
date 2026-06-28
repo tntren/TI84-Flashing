@@ -19,7 +19,11 @@ static int pendingStrIndices[MAX_QUEUED_STRS];
 static int queuedStrCount = 0;
 static int currentStrIdx = 0;
 
-#define FILE_BUFFER_SIZE 24576  // 24KB — fits a 16KB flash page + .8xk wrapper
+#define FILE_BUFFER_SIZE 24576
+
+static char cachedFilenames[6][96];
+static int cachedFileCount = 0;
+static bool pendingTransfer = false;
 
 void tiSetup() {
     cbl.setLines(TIP_PIN, RING_PIN);
@@ -188,7 +192,6 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
         int cmd = (int)val;
         Serial.print("Command T="); Serial.println(cmd);
 
-        // T=1 → list files
         if (cmd == 1) {
             if (!nasIsConnected()) {
                 Serial.println("Not connected");
@@ -196,7 +199,6 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
                 return 0;
             }
 
-            // Get file list from NAS
             char listBuf[2048];
             if (!nasListFiles(listBuf, sizeof(listBuf))) {
                 Serial.println("List failed");
@@ -204,9 +206,8 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
                 return 0;
             }
 
-            // Parse "1:file.8xk\n2:file2.8xp\n..." into individual strings
-            // Queue N (count) first, then Str1-Str6 with filenames
             tiClearStringQueue();
+            cachedFileCount = 0;
             int count = 0;
             char* line = strtok(listBuf, "\n");
             while (line && count < 6) {
@@ -215,22 +216,23 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
                     char fname[96];
                     strncpy(fname, colon + 1, 95);
                     fname[95] = '\0';
-                    // Truncate at 14 chars to fit TI screen
+                    strncpy(cachedFilenames[count], fname, 95);
+                    cachedFilenames[count][95] = '\0';
                     if (strlen(fname) > 14) fname[14] = '\0';
-                    tiQueueString(count + 1, fname); // Str1=file1, Str2=file2 etc
+                    tiQueueString(count + 1, fname);
                     count++;
                 }
                 line = strtok(NULL, "\n");
             }
+            cachedFileCount = count;
             tiQueueReal('N', count);
             Serial.print("Queued "); Serial.print(count); Serial.println(" files");
             return 0;
         }
 
-        // T=2 → transfer file (filename arrives next as Str0)
         if (cmd == 2) {
-            // filename will come in next string receive, handled there
-            Serial.println("Ready for filename");
+            pendingTransfer = true;
+            Serial.println("Ready for file index");
             return 0;
         }
 
@@ -242,37 +244,42 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
         }
     }
 
-    // ── Str0 received → filename to transfer ─────────────────────
-    if (type == VarTypes82::VarString && varName == 0x00) {
-        String filename = TIVar::strVarToString8x(tiData, model);
-        filename.trim();
+    if (type == VarTypes82::VarReal && varName == 'F' && pendingTransfer) {
+        pendingTransfer = false;
+        int idx = (int)TIVar::realToFloat8x(tiData, model) - 1;
+        Serial.print("Transfer index: "); Serial.println(idx);
+
+        if (idx < 0 || idx >= cachedFileCount) {
+            Serial.println("Index out of range");
+            return 0;
+        }
+
+        const char* filename = cachedFilenames[idx];
         Serial.print("Transfer request: "); Serial.println(filename);
 
         if (!nasIsConnected()) {
-            tiQueueReal('A', -1);
+            Serial.println("Not connected");
             return 0;
         }
 
         uint8_t* fileBuffer = (uint8_t*)malloc(FILE_BUFFER_SIZE);
         if (!fileBuffer) {
-            Serial.println("malloc failed for file buffer");
-            tiQueueReal('A', -3);
+            Serial.println("malloc failed");
             return 0;
         }
 
         int fileLen = 0;
-        if (!nasDownloadFile(filename.c_str(), fileBuffer, &fileLen, FILE_BUFFER_SIZE)) {
+        if (!nasDownloadFile(filename, fileBuffer, &fileLen, FILE_BUFFER_SIZE)) {
             Serial.println("Download failed");
             free(fileBuffer);
-            tiQueueReal('A', -2);
             return 0;
         }
 
         Serial.print("Downloaded "); Serial.print(fileLen); Serial.println(" bytes");
-        delay(5500); // calc is going to home screen
+        delay(5500);
 
         int result;
-        if (isFlashApp(filename.c_str())) {
+        if (isFlashApp(filename)) {
             Serial.println("Sending as flash app (.8xk)");
             result = tiSendApp(fileBuffer, fileLen);
         } else {
@@ -281,7 +288,7 @@ int onReceived(uint8_t type, enum Endpoint model, int datalen) {
         }
 
         free(fileBuffer);
-        tiQueueReal('A', result == 0 ? 1 : result);
+        Serial.print("Transfer result: "); Serial.println(result);
         return 0;
     }
 
